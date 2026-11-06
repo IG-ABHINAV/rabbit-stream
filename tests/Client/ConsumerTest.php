@@ -135,6 +135,21 @@ class ConsumerTest extends TestCase
         return is_int($value) ? $value : 0;
     }
 
+    private function getCreditsInFlight(Consumer $consumer): int
+    {
+        $value = (new \ReflectionProperty($consumer, 'creditsInFlight'))->getValue($consumer);
+        return is_int($value) ? $value : 0;
+    }
+
+    /** @param CapturedObjects<object> $sent */
+    private function countCreditRequests(CapturedObjects $sent): int
+    {
+        return count(array_filter(
+            $sent->all(),
+            static fn(object $request): bool => $request instanceof CreditRequestV1
+        ));
+    }
+
     public function testOffsetSubscribeFiltersEarlierMessagesWithinDeliveredChunkWithoutChangingChunkCredits(): void
     {
         [$consumer, $deliverCallback, $credits] = $this->consumerWithCapturedCredits(
@@ -2459,6 +2474,130 @@ class ConsumerTest extends TestCase
             'Nothing consumed yet: re-subscribe uses the original OffsetSpec'
         );
         $this->assertSame(7, $subscribe['credit']);
+    }
+
+    public function testChunkDeliveredAfterSubscriptionLostSendsNoCreditAndKeepsCreditsInFlightAtZero(): void
+    {
+        $deliverCallback = null;
+        $metadataHandler = null;
+        $sent = new CapturedObjects();
+        $connection = $this->createMock(StreamConnection::class);
+        $connection->expects($this->any())
+            ->method('registerSubscriber')
+            ->willReturnCallback(function (int $id, callable $callback) use (&$deliverCallback): void {
+                $deliverCallback = $callback;
+            });
+        $connection->expects($this->any())
+            ->method('registerMetadataUpdateHandler')
+            ->willReturnCallback(
+                function (string $stream, string $id, callable $handler) use (&$metadataHandler): void {
+                    $metadataHandler = $handler;
+                }
+            );
+        $connection->expects($this->any())->method('request')->willReturn(new \stdClass());
+        $connection->expects($this->any())
+            ->method('sendMessage')
+            ->willReturnCallback(static function (object $request) use ($sent): void {
+                $sent->add($request);
+            });
+
+        $consumer = new Consumer(
+            $connection,
+            'test-stream',
+            1,
+            OffsetSpec::first(),
+            initialCredit: 1,
+            creditWindowBytes: 0,
+        );
+        $this->assertIsCallable($deliverCallback);
+        $this->assertIsCallable($metadataHandler);
+
+        $deliverCallback($this->deliverOf($this->buildOneEntryChunk('before', 0)));
+        $this->assertSame(1, $this->countCreditRequests($sent));
+        $this->assertSame(1, $this->getCreditsInFlight($consumer), 'The replenished credit is in flight again');
+
+        $metadataHandler();
+        $this->assertTrue($consumer->isSubscriptionLost());
+        $this->assertSame(0, $this->getCreditsInFlight($consumer));
+
+        $deliverCallback($this->deliverOf($this->buildOneEntryChunk('after', 1)));
+        $this->assertSame(1, $this->countCreditRequests($sent), 'A lost subscription must not receive Credit');
+        $this->assertSame(0, $this->getCreditsInFlight($consumer), 'creditsInFlight must not go negative');
+
+        $this->assertTrue($consumer->resubscribeIfLost());
+        $this->assertSame(1, $this->getCreditsInFlight($consumer), 'Re-subscribe grants initialCredit again');
+
+        $deliverCallback($this->deliverOf($this->buildOneEntryChunk('again', 2)));
+        $this->assertSame(2, $this->countCreditRequests($sent), 'The re-subscribed consumer replenishes credit');
+        $this->assertSame(1, $this->getCreditsInFlight($consumer));
+    }
+
+    /**
+     * @return array{0: Consumer, 1: callable, 2: callable, 3: CapturedObjects<object>}
+     */
+    private function lostConsumerWithAdaptiveWindow(): array
+    {
+        $deliverCallback = null;
+        $metadataHandler = null;
+        $sent = new CapturedObjects();
+        $connection = $this->createMock(StreamConnection::class);
+        $connection->expects($this->any())
+            ->method('registerSubscriber')
+            ->willReturnCallback(function (int $id, callable $callback) use (&$deliverCallback): void {
+                $deliverCallback = $callback;
+            });
+        $connection->expects($this->any())
+            ->method('registerMetadataUpdateHandler')
+            ->willReturnCallback(
+                function (string $stream, string $id, callable $handler) use (&$metadataHandler): void {
+                    $metadataHandler = $handler;
+                }
+            );
+        $connection->expects($this->any())->method('request')->willReturn(new \stdClass());
+        $connection->expects($this->any())
+            ->method('sendMessage')
+            ->willReturnCallback(static function (object $request) use ($sent): void {
+                $sent->add($request);
+            });
+
+        $consumer = new Consumer(
+            $connection,
+            'test-stream',
+            1,
+            OffsetSpec::first(),
+            creditWindowBytes: 1048576,
+        );
+        $this->assertIsCallable($deliverCallback);
+        $this->assertIsCallable($metadataHandler);
+        $metadataHandler();
+        $this->assertTrue($consumer->isSubscriptionLost());
+
+        return [$consumer, $deliverCallback, $metadataHandler, $sent];
+    }
+
+    public function testLostChunkDoesNotChangeAdaptiveCreditStateOrSendCreditOnDrain(): void
+    {
+        [$consumer, $deliver, , $sent] = $this->lostConsumerWithAdaptiveWindow();
+        $targetBefore = $consumer->getCreditTarget();
+
+        $deliver($this->deliverOf($this->buildOneEntryChunk('after', 0)));
+        $this->assertSame($targetBefore, $consumer->getCreditTarget(), 'A lost chunk must not resize the window');
+        $this->assertSame(0, $this->getPendingCredits($consumer), 'A lost chunk must not owe credit');
+
+        $consumer->drain();
+        $this->assertSame(0, $this->countCreditRequests($sent), 'A lost subscription must not receive Credit on drain');
+    }
+
+    public function testSendPendingCreditsSendsNothingWhileSubscriptionIsLost(): void
+    {
+        [$consumer, , , $sent] = $this->lostConsumerWithAdaptiveWindow();
+        // Credit owed while lost (not reachable through a lost chunk after the fix): the guard alone must hold it.
+        $this->setPendingCredits($consumer, 5);
+
+        $consumer->drain();
+        $consumer->readOne(timeout: 0.0);
+        $this->assertSame(0, $this->countCreditRequests($sent), 'sendPendingCredits() must not send while lost');
+        $this->assertSame(5, $this->getPendingCredits($consumer));
     }
 
     public function testResubscribeBacksOffWhileStreamIsMissing(): void

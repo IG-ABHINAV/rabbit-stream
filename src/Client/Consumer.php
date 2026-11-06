@@ -652,22 +652,31 @@ class Consumer implements ConsumerInterface
                             $this->unreadCount++;
                         }
                     }
-                    $this->observeChunkSize($chunkLength);
+                    // A lost chunk must not change the adaptive credit state (#884).
+                    if (!$this->subscriptionLost) {
+                        $this->observeChunkSize($chunkLength);
+                    }
                 } catch (Throwable $exception) {
                     $parseException = $exception;
                     throw $exception;
                 } finally {
-                    // The broker has spent this credit by delivering the chunk even
-                    // when parsing fails, so always replenish the credit window.
-                    $this->creditsInFlight--;
-                    if ($this->pendingCredits < self::MAX_CREDIT) {
-                        $this->pendingCredits++;
-                    }
-                    try {
-                        $this->sendPendingCredits();
-                    } catch (Throwable $creditException) {
-                        if (!$parseException instanceof Throwable) {
-                            throw $creditException;
+                    // A chunk from a lost subscription carries no credit: the broker dropped
+                    // the subscription with its credit, and onStreamUnavailable() already reset
+                    // the counters. Counting it again would send Credit for a dead subscription
+                    // and drive creditsInFlight below zero (#884).
+                    if (!$this->subscriptionLost) {
+                        // The broker has spent this credit by delivering the chunk even
+                        // when parsing fails, so always replenish the credit window.
+                        $this->creditsInFlight--;
+                        if ($this->pendingCredits < self::MAX_CREDIT) {
+                            $this->pendingCredits++;
+                        }
+                        try {
+                            $this->sendPendingCredits();
+                        } catch (Throwable $creditException) {
+                            if (!$parseException instanceof Throwable) {
+                                throw $creditException;
+                            }
                         }
                     }
                 }
@@ -1127,8 +1136,11 @@ class Consumer implements ConsumerInterface
     {
         // The broker answers a Credit for an inactive single-active-consumer
         // subscription with PRECONDITION_FAILED. The credit waits until activation.
+        // A lost subscription has no broker-side credit to grant (#884). Its credit
+        // is granted again by resubscribeIfLost().
         if (
             $this->creditError instanceof ProtocolException
+            || $this->subscriptionLost
             || !$this->active
             || $this->pendingCredits <= 0
         ) {
