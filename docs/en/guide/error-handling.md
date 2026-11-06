@@ -748,6 +748,8 @@ try {
 }
 ```
 
+For a reconnect pattern for a producer and a consumer, see [Reconnect](reconnect.md).
+
 ## Best Practices
 
 ### 1. Catch Specific Exceptions First
