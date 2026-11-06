@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - **Consumer: stale credit errors received before MetadataUpdate no longer poison re-subscription (#883)** — clear any stored credit error when the broker reports that the subscription was dropped. This handles `SUBSCRIPTION_ID_NOT_EXIST` arriving before MetadataUpdate as well as during re-subscription; errors on a live subscription are still raised. `tests/Client/ConsumerTest.php` covers the earlier frame order and a live-subscription error.
+- **Heartbeat: the silence check no longer closes a connection with unread inbound frames (#937)** — The check measured only the time since the last library read. When the application did not read for two heartbeat intervals, the client closed a healthy connection with a `ConnectionException` ("missing inbound frames"). The check now polls the socket first, and readable data counts as inbound activity. The connection still closes after two heartbeat intervals without inbound data. The read path reports a peer that closed the socket as "closed by peer". `tests/StreamConnectionTest.php` covers unread inbound frames and a readable end-of-file.
 
 ## [1.13.2] - 2026-10-29
 
