@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Docs: the producer docs name every cause of a lost publish (#991)** — the PHPDoc of `getPendingConfirms()`, `getLostConfirmCount()` and `close()`, the `ProducerInterface` docs and the producer API reference did not list a failed `DeletePublisher` exchange in `close()`. They now list connection loss, publisher loss, a failed `DeletePublisher` and the drain timeout. The reference states that each failed publish goes once to `onConfirm` with `Producer::CONNECTION_LOST_ERROR_CODE`, and that `close()` rethrows the `DeletePublisher` exception. The drain timeout is named as the `$closeConfirmDrainTimeout` option, default `Producer::DEFAULT_CLOSE_CONFIRM_DRAIN_TIMEOUT` (2.0 s). No code behaviour changes.
 - **Docs: the protocol pages state the heartbeat rule of the client (#969)** — the Server-Push Frames and Connection Management pages said that the connection is dead after one heartbeat interval without frames. The client closes the connection after two heartbeat intervals without inbound data. The pages now say so, that every received byte counts as inbound data (including data that waits unread in the socket), and that the check runs only inside a library call. No code changes.
 
 ### Fixed
