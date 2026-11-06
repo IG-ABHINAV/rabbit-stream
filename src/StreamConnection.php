@@ -2248,6 +2248,7 @@ class StreamConnection
      * @param float $timeout Seconds to wait for data (0.0 = non-blocking poll); stop() is observed within one second
      * @return ReadBuffer|null Parsed frame buffer, or null if no data arrived within the timeout
      * @throws ConnectionException If the socket is not connected, frame exceeds max size, or read error occurs
+     * @throws DeserializationException If the frame size is below 2 (the connection is closed)
      */
     public function readFrame(float $timeout = 30.0): ?ReadBuffer
     {
@@ -2322,6 +2323,7 @@ class StreamConnection
      *
      * @return ReadBuffer|null Parsed frame buffer, or null if no data arrived
      * @throws ConnectionException If the socket is not connected, frame exceeds max size, or read error occurs
+     * @throws DeserializationException If the frame size is below 2 (the connection is closed)
      */
     private function readFrameNoWait(): ?ReadBuffer
     {
@@ -2341,6 +2343,9 @@ class StreamConnection
         $size = $sizeUnpacked[1];
 
         if ($size < 2) {
+            // The body bytes of this frame are still in the socket, so the byte
+            // stream cannot be resynchronised. Close, as the cap branch does.
+            $this->close();
             throw new DeserializationException("Frame size {$size} is too small to contain a key");
         }
 
@@ -2376,12 +2381,10 @@ class StreamConnection
                 );
             }
 
-            $remainingData = $this->readBytes($size - 2, mustComplete: true);
-            if ($remainingData === null) {
+            $frameData = $this->readBytes($size, mustComplete: true, prefix: $keyData);
+            if ($frameData === null) {
                 throw new ConnectionException("Failed to read frame data");
             }
-
-            $frameData = $keyData . $remainingData;
         }
 
         $this->debugFrame('Socket <-', $frameData, keyOffset: 0);
@@ -2465,14 +2468,17 @@ class StreamConnection
      *    connection permanently (GitHub #390). The connection is now closed with
      *    an explicit error instead.
      *
-     * @param int  $length       Number of bytes to read (0 returns '')
-     * @param bool $mustComplete True when the caller is already mid-frame, so a
-     *                           short read is unrecoverable rather than benign
+     * @param int    $length       Number of bytes to read, including $prefix (0 returns '')
+     * @param bool   $mustComplete True when the caller is already mid-frame, so a
+     *                             short read is unrecoverable rather than benign
+     * @param string $prefix       Bytes already read that start the result (GitHub #940).
+     *                             They are not read again, and the result is built in one
+     *                             string, so a large frame is not copied to join them.
      * @return ?string The bytes read, or null if no byte arrived at a frame boundary
      * @throws ConnectionException If the connection is not connected, the peer closed it,
      *                             the read fails, or an incomplete frame timed out
      */
-    private function readBytes(int $length, bool $mustComplete = false): ?string
+    private function readBytes(int $length, bool $mustComplete = false, string $prefix = ''): ?string
     {
         $stream = $this->requireStream();
 
@@ -2480,8 +2486,8 @@ class StreamConnection
             return '';
         }
 
-        $data = '';
-        $remaining = $length;
+        $data = $prefix;
+        $remaining = $length - strlen($prefix);
         $deadline = microtime(true) + $this->socketTimeout;
 
         while ($remaining > 0) {
